@@ -1,0 +1,222 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        type: string
+
+run-name: "release ${{ inputs.tag }}"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: "release-${{ inputs.tag }}"
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out workflow commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Validate tag and release state
+        shell: pwsh
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          if ($env:GITHUB_REF -ne "refs/heads/main") {
+            throw "Run this workflow from main. Current ref: $env:GITHUB_REF"
+          }
+
+          $tag = ($env:TAG_INPUT).Trim()
+          if ($tag -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$') {
+            throw "Invalid tag '$tag'. Use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease."
+          }
+
+          git fetch origin main --tags --force
+          if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+
+          $tagExists = $false
+          git rev-parse --verify --quiet "refs/tags/$tag" 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) { $tagExists = $true }
+
+          if ($tagExists) {
+            $type = (git cat-file -t "refs/tags/$tag").Trim()
+            if ($LASTEXITCODE -ne 0) { throw "Could not inspect tag $tag" }
+            if ($type -ne "tag") { throw "Tag $tag is lightweight. Use an annotated tag." }
+
+            git merge-base --is-ancestor "refs/tags/$tag^{commit}" "origin/main"
+            if ($LASTEXITCODE -ne 0) { throw "Tag $tag is not on main." }
+
+            $commit = (git rev-parse "refs/tags/$tag^{commit}").Trim()
+            git checkout --detach "refs/tags/$tag^{commit}"
+            if ($LASTEXITCODE -ne 0) { throw "Could not check out tag $tag" }
+          } else {
+            git merge-base --is-ancestor "$env:GITHUB_SHA" "origin/main"
+            if ($LASTEXITCODE -ne 0) { throw "The workflow commit is not on main. Re-run from main." }
+            $commit = $env:GITHUB_SHA
+          }
+
+          $releaseJson = (gh release view $tag --json isDraft 2>$null) -join "`n"
+          $viewExit = $LASTEXITCODE
+          # gh exits 1 when no release exists; reset so the step does not fail on exit $LASTEXITCODE.
+          $global:LASTEXITCODE = 0
+          $releaseExists = $false
+          if ($viewExit -eq 0) {
+            if (-not $releaseJson) { throw "gh release view returned no data." }
+            $release = $releaseJson | ConvertFrom-Json
+            if (-not $release.isDraft) {
+              throw "A published release already exists for $tag."
+            }
+            $releaseExists = $true
+          }
+
+          "TAG=$tag" >> $env:GITHUB_ENV
+          "TAG_EXISTS=$($tagExists.ToString().ToLowerInvariant())" >> $env:GITHUB_ENV
+          "TAG_IS_PRERELEASE=$($tag.Contains('-').ToString().ToLowerInvariant())" >> $env:GITHUB_ENV
+          "RELEASE_EXISTS=$($releaseExists.ToString().ToLowerInvariant())" >> $env:GITHUB_ENV
+          "TAG_COMMIT=$commit" >> $env:GITHUB_ENV
+
+          exit 0
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue
+          .\build.ps1 -OutputDir "dist/batcap/bin"
+
+      - name: Verify build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path "dist/batcap/bin/batcap.exe")) { throw "batcap.exe was not built." }
+          $exe = Get-Item "dist/batcap/bin/batcap.exe"
+          if ($exe.Length -eq 0) { throw "batcap.exe is empty." }
+
+      - name: Package release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $stage = Join-Path $env:GITHUB_WORKSPACE "dist/batcap"
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          New-Item -ItemType Directory -Path (Join-Path $stage "docs") -Force | Out-Null
+          Copy-Item "bin/.conf" (Join-Path $stage "bin/.conf")
+          Copy-Item "README.md" $stage
+          Copy-Item "LICENSE" $stage
+          Copy-Item "docs/*.md" (Join-Path $stage "docs")
+
+          $zipName = "$env:TAG.zip"
+          $zipPath = Join-Path $dist $zipName
+          Compress-Archive -Path $stage -DestinationPath $zipPath -CompressionLevel Optimal
+
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zipName" | Set-Content -Path (Join-Path $dist "SHA256SUMS.txt") -Encoding ascii
+
+          "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+          "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
+          "ZIP_SHA256=$hash" >> $env:GITHUB_ENV
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: batcap-${{ inputs.tag }}-win
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Prepare release notes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $templateLines = git show "$($env:GITHUB_SHA):.github/release-template.md"
+          if ($LASTEXITCODE -ne 0) { throw "Could not read release template from the workflow commit." }
+          $template = $templateLines -join "`n"
+          $notes = $template.Replace("{{TAG}}", $env:TAG).Replace("{{COMMIT}}", $env:TAG_COMMIT).Replace("{{ZIP_NAME}}", $env:ZIP_NAME)
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          Set-Content -Path $notesPath -Value $notes -Encoding utf8
+          "NOTES_PATH=$notesPath" >> $env:GITHUB_ENV
+
+      - name: Create tag if missing
+        if: env.TAG_EXISTS != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Create the tag only after the build, package, and artifact upload succeed.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$env:TAG" -m "batcap $env:TAG" "$env:TAG_COMMIT"
+          if ($LASTEXITCODE -ne 0) { throw "git tag failed" }
+          git push origin "refs/tags/$env:TAG"
+          if ($LASTEXITCODE -ne 0) { throw "git push failed" }
+
+      - name: Create or update draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $title = $env:TAG
+          $checksum = Join-Path (Split-Path $env:ZIP_PATH) "SHA256SUMS.txt"
+
+          # Reuse an existing draft so manual edits to the release body are kept.
+          if ($env:RELEASE_EXISTS -eq "true") {
+            $releaseJson = gh release view $env:TAG --json isDraft,assets --jq '{isDraft: .isDraft, assets: [.assets[].name]}'
+            if ($LASTEXITCODE -ne 0) { throw "gh release view failed" }
+            $release = $releaseJson | ConvertFrom-Json
+            if (-not $release.isDraft) { throw "A published release already exists for $env:TAG." }
+            gh release edit $env:TAG --title $title
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
+            foreach ($asset in @($release.assets)) {
+              if ($asset -and $asset -ne $env:ZIP_NAME -and $asset -like "*.zip") {
+                gh release delete-asset $env:TAG $asset --yes
+                if ($LASTEXITCODE -ne 0) { throw "gh release delete-asset failed for $asset" }
+              }
+            }
+            gh release upload $env:TAG $env:ZIP_PATH $checksum --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          } else {
+            $ghArgs = @(
+              "release", "create", $env:TAG,
+              "--draft",
+              "--verify-tag",
+              "--title", $title,
+              "--notes-file", $env:NOTES_PATH
+            )
+            if ($env:TAG_IS_PRERELEASE -eq "true") { $ghArgs += "--prerelease" }
+            $ghArgs += $env:ZIP_PATH
+            $ghArgs += $checksum
+            & gh @ghArgs
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $lines = @(
+            "## Release $env:TAG",
+            "",
+            "- Commit: $env:TAG_COMMIT",
+            "- Asset: $env:ZIP_NAME",
+            "- SHA256: $env:ZIP_SHA256",
+            "- Draft: https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:TAG"
+          )
+          $lines | Add-Content -Path $env:GITHUB_STEP_SUMMARY
