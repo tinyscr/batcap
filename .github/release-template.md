@@ -10,21 +10,19 @@
 
 ### Security
 
--
+- 
 
 ### Improvements
 
-- 
+-
 
 ### Docs
 
 -
 
-### Install
+**Commit**: 
+```
+<commit>
+```
 
-1. Download and extract **{{ZIP_NAME}}**.
-2. Set `DesignCapacity` in `batcap/bin/.conf`. See [batcap/docs/config.md](https://github.com/tinyscr/batcap/blob/main/docs/config.md).
-3. Run **bin/batcap.exe**.
-
-
-**Commit**: {{COMMIT}}
+**Full Changelog**: https://github.com/tinyscr/batcap/commits/<tag>

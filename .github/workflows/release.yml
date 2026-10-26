@@ -149,7 +149,7 @@ jobs:
           $templateLines = git show "$($env:GITHUB_SHA):.github/release-template.md"
           if ($LASTEXITCODE -ne 0) { throw "Could not read release template from the workflow commit." }
           $template = $templateLines -join "`n"
-          $notes = $template.Replace("{{TAG}}", $env:TAG).Replace("{{COMMIT}}", $env:TAG_COMMIT).Replace("{{ZIP_NAME}}", $env:ZIP_NAME)
+          $notes = $template.Replace("<commit>", $env:TAG_COMMIT).Replace("<tag>", $env:TAG)
           $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
           Set-Content -Path $notesPath -Value $notes -Encoding utf8
           "NOTES_PATH=$notesPath" >> $env:GITHUB_ENV
